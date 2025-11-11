@@ -1,0 +1,945 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>NEET Prep HQ - AI Quiz Platform</title>
+    <!-- Load Tailwind CSS from CDN for styling -->
+    <script src="https://cdn.tailwindcss.com"></script>
+    <!-- Load Lucide icons library -->
+    <script src="https://unpkg.com/lucide@latest"></script>
+    <style>
+        /* Custom styles for the app */
+        :root {
+            --color-indigo-600: #4f46e5;
+            --color-indigo-700: #4338ca;
+            --color-indigo-800: #3730a3;
+        }
+        body {
+            font-family: 'Inter', sans-serif;
+            background-color: #f9fafb; /* bg-gray-50 */
+        }
+        /* Custom focus state */
+        .option-selected {
+            background-color: #eef2ff !important; /* indigo-50 */
+            border-color: var(--color-indigo-600) !important;
+            box-shadow: 0 0 0 2px var(--color-indigo-600);
+        }
+        .latex-display {
+            font-family: monospace;
+            white-space: pre-wrap;
+            background-color: #f0f4ff; /* A light blue shade for math */
+            padding: 4px 8px;
+            border-radius: 4px;
+            display: inline-block;
+            margin: 0 2px;
+            font-size: 0.95em;
+        }
+        .animate-spin {
+            animation: spin 1s linear infinite;
+        }
+        @keyframes spin {
+            from { transform: rotate(0deg); }
+            to { transform: rotate(360deg); }
+        }
+    </style>
+</head>
+<body class="min-h-screen">
+
+    <div id="app" class="min-h-screen flex flex-col items-center">
+        <!-- Application content will be rendered here -->
+    </div>
+
+    <!-- Firebase and Application Logic -->
+    <script type="module">
+        // --- FIREBASE IMPORTS ---
+        import { initializeApp } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-app.js";
+        import { getAuth, signInAnonymously, signInWithCustomToken, onAuthStateChanged } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-auth.js";
+        import { getFirestore, collection, query, orderBy, onSnapshot, setDoc, doc, serverTimestamp } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-firestore.js";
+
+        // --- GLOBAL CONFIG & STATE ---
+
+        // Global variables provided by the Canvas environment
+        const appId = typeof __app_id !== 'undefined' ? __app_id : 'default-app-id';
+        const firebaseConfig = typeof __firebase_config !== 'undefined' ? JSON.parse(__firebase_config) : {};
+        const initialAuthToken = typeof __initial_auth_token !== 'undefined' ? __initial_auth_token : null;
+        const API_KEY = ""; // API Key is automatically handled by the environment
+
+        // LLM API Setup
+        const MODEL_NAME = "gemini-2.5-flash-preview-09-2025";
+        const API_URL = `https://generativelanguage.googleapis.com/v1beta/models/${MODEL_NAME}:generateContent?key=${API_KEY}`;
+
+        // Global Firebase Instances and Auth State
+        let db = null;
+        let auth = null;
+        let userId = null;
+        let isAuthReady = false;
+        let authError = null;
+        let history = [];
+        let historyUnsubscribe = null; // To manage the Firestore subscription
+
+        // Application State
+        let state = {
+            view: 'loading_auth', // loading_auth, selection, loading_quiz, quiz, loading_analysis, analysis, history, history_analysis
+            selection: { subject: null, difficulty: null },
+            quiz: null,
+            userAnswers: {},
+            loadingMessage: "Authenticating user and connecting to database...",
+            selectedHistoryId: null,
+            currentAttemptId: null // ID of the most recent saved attempt for analysis display
+        };
+        
+        const SUBJECTS = ["Physics", "Chemistry", "Biology"];
+        const DIFFICULTIES = ["Easy", "Medium", "Hard"];
+
+
+        // --- UTILITIES ---
+
+        // Exponential backoff retry function for API calls
+        const retryFetch = async (url, options, retries = 3) => {
+            for (let i = 0; i < retries; i++) {
+                try {
+                    const response = await fetch(url, options);
+                    if (response.ok) {
+                        return response;
+                    }
+                    if (response.status === 429) {
+                        await new Promise(resolve => setTimeout(resolve, Math.pow(2, i) * 1000));
+                    } else {
+                        throw new Error(`HTTP error! status: ${response.status}`);
+                    }
+                } catch (error) {
+                    if (i === retries - 1) throw error;
+                    await new Promise(resolve => setTimeout(resolve, Math.pow(2, i) * 1000));
+                }
+            }
+        };
+
+        const QuizGenerationSchema = {
+            type: "ARRAY",
+            items: {
+                type: "OBJECT",
+                properties: {
+                    id: { "type": "NUMBER" },
+                    questionText: { "type": "STRING" },
+                    options: {
+                        "type": "ARRAY",
+                        "items": { "type": "STRING" }
+                    },
+                    correctAnswerIndex: {
+                        "type": "NUMBER",
+                        "description": "Index of the correct answer in the options array (0, 1, 2, or 3)"
+                    },
+                    topic: { "type": "STRING", "description": "The specific NEET topic this question covers (e.g., Electrostatics, Genetics, Chemical Bonding)" }
+                },
+                propertyOrdering: ["id", "questionText", "options", "correctAnswerIndex", "topic"]
+            }
+        };
+
+        const AnalysisSchema = {
+            type: "OBJECT",
+            properties: {
+                summary: {
+                    "type": "STRING",
+                    "description": "A concise, encouraging summary of the student's performance, focusing on the 10-question set (e.g., 'Excellent performance, showing mastery in Human Physiology...')"
+                },
+                scoreOutOf10: { "type": "NUMBER" },
+                strongPoints: {
+                    "type": "ARRAY",
+                    "items": { "type": "STRING" },
+                    "description": "2-3 specific topics or concepts the student mastered (based on correct answers)."
+                },
+                weakPoints: {
+                    "type": "ARRAY",
+                    "items": { "type": "STRING" },
+                    "description": "2-3 specific topics or concepts where the student needs improvement (based on incorrect answers)."
+                },
+                detailedSolutions: {
+                    "type": "ARRAY",
+                    "items": {
+                        "type": "OBJECT",
+                        "properties": {
+                            "questionId": { "type": "NUMBER" },
+                            "userAnswerIndex": { "type": "NUMBER" },
+                            "isCorrect": { "type": "BOOLEAN" },
+                            "solution": {
+                                "type": "STRING",
+                                "description": "A detailed, step-by-step solution for the question, suitable for doubt clearing and clear explanation."
+                            }
+                        }
+                    }
+                }
+            }
+        };
+
+        // DOM utility to safely create and append elements
+        const createElement = (tag, classes = [], content = '') => {
+            const el = document.createElement(tag);
+            if (classes.length) el.className = classes.join(' ');
+            if (typeof content === 'string') {
+                el.innerHTML = content;
+            } else if (content instanceof Node) {
+                el.appendChild(content);
+            }
+            return el;
+        };
+        
+        // Reworked Function to render Lucide Icons safely (returns the SVG Element)
+        const getIconSvg = (name) => {
+            // Check if Lucide library and the specific icon exists
+            if (typeof lucide === 'undefined' || !lucide.icons || !lucide.icons[name]) {
+                return null;
+            }
+
+            try {
+                // Use the programmatic API to generate the SVG string. 
+                // We let the wrapper element (in renderIcon) handle classes.
+                const svgString = lucide.icons[name].toSvg({
+                    width: '100%',
+                    height: '100%',
+                    class: '' 
+                });
+                
+                // Create a temporary element to parse the SVG string into a DOM element
+                const tempDiv = document.createElement('div');
+                tempDiv.innerHTML = svgString;
+
+                // The first child is the SVG element itself
+                return tempDiv.firstChild;
+
+            } catch (e) {
+                console.error(`Error generating SVG for icon "${name}":`, e);
+                return null;
+            }
+        };
+
+        // Function to render Lucide Icons (returns the SVG element wrapped in a span, or just the span)
+        const renderIcon = (name, classes = 'w-5 h-5 mr-2') => {
+            const iconContainer = createElement('span', classes.split(' '));
+            const svg = getIconSvg(name); // Now returns the SVG element
+            if (svg) iconContainer.appendChild(svg);
+            return iconContainer;
+        };
+
+        // Simple State Update function
+        const setState = (newState) => {
+            state = { ...state, ...newState };
+            renderApp();
+        };
+
+        // --- FIREBASE LOGIC ---
+
+        const initializeFirebase = () => {
+            if (Object.keys(firebaseConfig).length === 0) {
+                authError = "Firebase configuration is missing or invalid.";
+                isAuthReady = true;
+                setState({ view: 'error' });
+                return;
+            }
+
+            try {
+                const app = initializeApp(firebaseConfig);
+                db = getFirestore(app);
+                auth = getAuth(app);
+                // setLogLevel('debug'); // For debugging Firestore in console
+
+                // 1. Authentication function
+                const authenticate = async () => {
+                    try {
+                        if (initialAuthToken) {
+                            await signInWithCustomToken(auth, initialAuthToken);
+                        } else {
+                            await signInAnonymously(auth);
+                        }
+                    } catch (e) {
+                        console.error("Authentication failed during sign-in attempt:", e);
+                        authError = "Failed to sign in. Check console for details.";
+                    }
+                };
+
+                // 2. Set up Auth State Listener (Crucial for setting userId and readiness)
+                onAuthStateChanged(auth, (user) => {
+                    if (user) {
+                        userId = user.uid;
+                        authError = null;
+                        startHistoryListener();
+                        setState({ view: 'selection' });
+                    } else {
+                        userId = null;
+                        if (!authError) authError = "Authentication check failed. Please try again.";
+                        setState({ view: 'error' });
+                    }
+                    isAuthReady = true;
+                });
+
+                // 3. Run authentication to trigger state change
+                authenticate();
+            } catch (e) {
+                console.error("Firebase Initialization Error:", e);
+                authError = "Could not initialize Firebase services.";
+                isAuthReady = true;
+                setState({ view: 'error' });
+            }
+        };
+
+        const startHistoryListener = () => {
+            if (!isAuthReady || !userId || !db) return;
+
+            if (historyUnsubscribe) historyUnsubscribe(); // Clean up previous listener
+
+            const historyPath = `artifacts/${appId}/users/${userId}/quizAttempts`;
+            const q = query(collection(db, historyPath), orderBy('timestamp', 'desc'));
+
+            historyUnsubscribe = onSnapshot(q, (snapshot) => {
+                history = snapshot.docs.map(doc => ({
+                    id: doc.id,
+                    ...doc.data()
+                }));
+                // Re-render if we are viewing history or analysis to update the data
+                if (state.view === 'history' || state.view === 'history_analysis') {
+                    renderApp();
+                }
+            }, (error) => {
+                console.error("Firestore history snapshot error:", error);
+            });
+        };
+
+
+        // --- LLM GENERATION FUNCTIONS ---
+
+        const fetchQuizQuestions = async (subject, difficulty) => {
+            const systemPrompt = `You are an expert NEET (National Eligibility cum Entrance Test) question paper setter. Generate exactly 10 multiple-choice questions (MCQs) for the subject: ${subject} at a difficulty level of ${difficulty}. Ensure the questions strictly follow the NEET syllabus for Physics, Chemistry, and Biology. Use LaTeX for all mathematical or chemical formulas in the question text or options (e.g., $E=mc^2$ or $\text{H}_2\text{SO}_4$).`;
+
+            const userQuery = `Generate 10 MCQs for NEET in ${subject} on ${difficulty} level. Focus on core topics like Human Physiology, Modern Physics, and Chemical Bonding.`;
+
+            const payload = {
+                contents: [{ parts: [{ text: userQuery }] }],
+                systemInstruction: {
+                    parts: [{ text: systemPrompt }]
+                },
+                generationConfig: {
+                    responseMimeType: "application/json",
+                    responseSchema: QuizGenerationSchema
+                }
+            };
+
+            const options = {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify(payload)
+            };
+
+            const response = await retryFetch(API_URL, options);
+            const result = await response.json();
+
+            const text = result.candidates?.[0]?.content?.parts?.[0]?.text;
+            if (!text) throw new Error("LLM did not return question data.");
+
+            return JSON.parse(text);
+        };
+
+        const fetchAnalysis = async (quiz, userAnswers, subject, difficulty) => {
+            const quizWithAnswers = quiz.map(q => ({
+                ...q,
+                userAnswerIndex: userAnswers[q.id],
+                isCorrect: userAnswers[q.id] === q.correctAnswerIndex
+            }));
+
+            const systemPrompt = `You are a dedicated NEET academic counselor and analyst. Analyze the provided 10-question quiz results for the student. Provide an overall summary, identify 2-3 specific strong points (topics/concepts) and 2-3 weak points (topics/concepts) based on their performance. For every question, provide a detailed, step-by-step solution. The quiz was on ${subject} at ${difficulty} level.`;
+
+            const userQuery = `Analyze this completed quiz and the student's answers: ${JSON.stringify(quizWithAnswers)}`;
+
+            const payload = {
+                contents: [{ parts: [{ text: userQuery }] }],
+                systemInstruction: {
+                    parts: [{ text: systemPrompt }]
+                },
+                generationConfig: {
+                    responseMimeType: "application/json",
+                    responseSchema: AnalysisSchema
+                }
+            };
+
+            const options = {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify(payload)
+            };
+
+            const response = await retryFetch(API_URL, options);
+            const result = await response.json();
+
+            const text = result.candidates?.[0]?.content?.parts?.[0]?.text;
+            if (!text) throw new Error("LLM did not return analysis data.");
+
+            return JSON.parse(text);
+        };
+
+
+        // --- VIEW RENDERING FUNCTIONS (Vanilla JS equivalent of React Components) ---
+        
+        const renderHeader = () => {
+            const header = createElement('header', ['w-full', 'bg-white', 'shadow-md', 'p-4', 'sticky', 'top-0', 'z-50']);
+            const container = createElement('div', ['max-w-7xl', 'mx-auto', 'flex', 'justify-between', 'items-center']);
+            
+            // Logo and Title
+            const logoArea = createElement('div', ['flex', 'items-center']);
+            const logo = createElement('img', ['rounded-full', 'mr-3'], '');
+            logo.src = "https://placehold.co/40x40/4F46E5/ffffff?text=NEET";
+            logo.alt = "NEET Logo";
+            const title = createElement('h1', ['text-2xl', 'font-black', 'text-indigo-700'], 'NEET Prep HQ');
+            logoArea.append(logo, title);
+
+            // Controls and User ID
+            const controlArea = createElement('div', ['flex', 'items-center', 'space-x-4']);
+            
+            const controlButton = createElement('button', [
+                'p-2', 'text-sm', 'font-semibold', 'rounded-full', 'transition-colors',
+                'bg-indigo-100', 'text-indigo-700', 'hover:bg-indigo-200'
+            ]);
+            
+            if (state.view === 'selection') {
+                controlButton.textContent = 'View History';
+                controlButton.onclick = () => setState({ view: 'history' });
+            } else {
+                controlButton.textContent = 'New Quiz';
+                controlButton.onclick = resetApp;
+            }
+
+            const userIdDisplay = createElement('span', ['text-xs', 'text-gray-500', 'hidden', 'sm:block'], `User ID: ${userId ? userId.substring(0, 8) + '...' : 'N/A'}`);
+            
+            controlArea.append(controlButton, userIdDisplay);
+            
+            container.append(logoArea, controlArea);
+            header.appendChild(container);
+            return header;
+        };
+        
+        const renderFooter = () => {
+            return createElement('footer', [
+                'w-full', 'p-3', 'text-center', 'bg-gray-800', 'text-gray-400', 'text-xs', 'mt-auto'
+            ], '&copy; 2024 NEET Prep HQ. Powered by Real-Time Gemini AI Analysis and Firestore.');
+        };
+
+        const renderErrorDisplay = (message) => {
+            const container = createElement('div', ['p-10', 'bg-red-100', 'border-l-4', 'border-red-500', 'text-red-700', 'rounded-xl', 'shadow-lg', 'max-w-lg', 'w-full']);
+            const h2 = createElement('h2', ['text-xl', 'font-bold', 'mb-2'], 'Application Error');
+            const p1 = createElement('p', [], message);
+            const p2 = createElement('p', ['mt-4', 'text-sm', 'text-red-600'], 'Please try refreshing the page or check the browser console for details.');
+            container.append(h2, p1, p2);
+            return container;
+        };
+
+        const renderLoadingSpinner = (message) => {
+            const container = createElement('div', ['flex', 'flex-col', 'items-center', 'justify-center', 'p-8', 'bg-white/50', 'rounded-xl', 'shadow-lg', 'max-w-md', 'w-full']);
+            
+            const spinner = createElement('div', ['h-10', 'w-10', 'animate-spin', 'text-indigo-600']);
+            // FIX: Ensure icon fills container using w-full h-full classes on the span
+            spinner.appendChild(renderIcon('RefreshCcw', 'w-full h-full')); 
+
+            const p1 = createElement('p', ['mt-4', 'text-center', 'text-indigo-700', 'font-medium'], message);
+            const p2 = createElement('p', ['mt-2', 'text-xs', 'text-gray-500'], 'This involves real-time AI generation. Please be patient.');
+            
+            container.append(spinner, p1, p2);
+            return container;
+        };
+
+        const renderQuizSelection = () => {
+            const container = createElement('div', ['p-6', 'md:p-10', 'bg-white', 'rounded-2xl', 'shadow-2xl', 'max-w-lg', 'w-full']);
+            
+            const h2 = createElement('h2', ['text-3xl', 'font-extrabold', 'text-indigo-800', 'mb-6', 'flex', 'items-center']);
+            // FIX: Add icon with specific classes, then append text content
+            h2.appendChild(renderIcon('Brain', 'w-6 h-6 mr-3'));
+            h2.appendChild(document.createTextNode(' Start a New Quiz'));
+            
+            container.appendChild(h2);
+
+            const alertMessageContainer = createElement('div', ['p-0', 'mb-0', 'transition-all', 'duration-300']);
+            container.appendChild(alertMessageContainer);
+
+            // Subject Selection
+            const subjectDiv = createElement('div', ['mb-8']);
+            subjectDiv.appendChild(createElement('label', ['block', 'text-sm', 'font-semibold', 'text-gray-700', 'mb-2'], '1. Select Subject'));
+            const subjectGrid = createElement('div', ['grid', 'grid-cols-3', 'gap-3']);
+
+            SUBJECTS.forEach((sub) => {
+                const isSelected = state.selection.subject === sub;
+                const btn = createElement('button', [
+                    'p-3', 'rounded-xl', 'transition-all', 'font-medium', 'text-sm',
+                    isSelected ? 'bg-indigo-600' : 'bg-indigo-100',
+                    isSelected ? 'text-white' : 'text-indigo-800',
+                    isSelected ? 'shadow-lg' : 'hover:bg-indigo-200',
+                    isSelected ? 'transform' : '',
+                    isSelected ? 'scale-105' : ''
+                ], sub);
+                btn.onclick = () => setState({ selection: { ...state.selection, subject: sub } });
+                subjectGrid.appendChild(btn);
+            });
+            subjectDiv.appendChild(subjectGrid);
+            container.appendChild(subjectDiv);
+
+            // Difficulty Selection
+            const difficultyDiv = createElement('div', ['mb-8']);
+            difficultyDiv.appendChild(createElement('label', ['block', 'text-sm', 'font-semibold', 'text-gray-700', 'mb-2'], '2. Select Difficulty'));
+            const difficultyGrid = createElement('div', ['grid', 'grid-cols-3', 'gap-3']);
+
+            DIFFICULTIES.forEach((diff) => {
+                const isSelected = state.selection.difficulty === diff;
+                const btn = createElement('button', [
+                    'p-3', 'rounded-xl', 'transition-all', 'font-medium', 'text-sm',
+                    isSelected ? 'bg-green-600' : 'bg-green-100',
+                    isSelected ? 'text-white' : 'text-green-800',
+                    isSelected ? 'shadow-lg' : 'hover:bg-green-200',
+                    isSelected ? 'transform' : '',
+                    isSelected ? 'scale-105' : ''
+                ], diff);
+                btn.onclick = () => setState({ selection: { ...state.selection, difficulty: diff } });
+                difficultyGrid.appendChild(btn);
+            });
+            difficultyDiv.appendChild(difficultyGrid);
+            container.appendChild(difficultyDiv);
+
+            // Start Button
+            const startButton = createElement('button', [
+                'w-full', 'py-4', 'text-lg', 'font-bold', 'bg-indigo-600', 'text-white',
+                'rounded-xl', 'shadow-md', 'hover:bg-indigo-700', 'transition-colors',
+                'flex', 'items-center', 'justify-center'
+            ], 'Start 10-Question Test');
+            startButton.prepend(renderIcon('Zap', 'w-5 h-5 mr-2'));
+            startButton.appendChild(renderIcon('Zap', 'w-5 h-5 ml-2'));
+            
+            const handleStartQuiz = async () => {
+                if (state.selection.subject && state.selection.difficulty) {
+                    setState({ view: 'loading_quiz', loadingMessage: `Generating 10 ${state.selection.difficulty} questions on ${state.selection.subject}...` });
+                    try {
+                        const newQuiz = await fetchQuizQuestions(state.selection.subject, state.selection.difficulty);
+                        const finalQuiz = newQuiz.map((q, index) => ({
+                            ...q,
+                            id: index + 1,
+                            correctAnswerIndex: q.correctAnswerIndex
+                        }));
+                        setState({ quiz: finalQuiz, userAnswers: {}, view: 'quiz' });
+                    } catch (error) {
+                        console.error("Quiz Generation Error:", error);
+                        setState({ 
+                            loadingMessage: "Failed to generate quiz due to an API error. Please try again.",
+                            view: 'selection' // Go back to selection
+                        });
+                        alertMessageContainer.innerHTML = `<div class="p-3 mb-4 bg-yellow-100 border-l-4 border-yellow-500 text-yellow-700 rounded">An error occurred while generating the quiz. Please try again.</div>`;
+                        setTimeout(() => alertMessageContainer.innerHTML = '', 4000);
+                    }
+                } else {
+                    alertMessageContainer.innerHTML = `<div class="p-3 mb-4 bg-yellow-100 border-l-4 border-yellow-500 text-yellow-700 rounded">Please select both a Subject and a Difficulty.</div>`;
+                    setTimeout(() => alertMessageContainer.innerHTML = '', 3000);
+                }
+            };
+            startButton.onclick = handleStartQuiz;
+
+            if (!state.selection.subject || !state.selection.difficulty) {
+                startButton.classList.add('bg-gray-400', 'disabled:cursor-not-allowed');
+                startButton.disabled = true;
+            } else {
+                startButton.classList.remove('bg-gray-400', 'disabled:cursor-not-allowed');
+                startButton.disabled = false;
+            }
+
+            container.appendChild(startButton);
+            return container;
+        };
+        
+        const renderQuizView = () => {
+            if (!state.quiz) return renderErrorDisplay("Quiz data is missing.");
+
+            const container = createElement('div', ['p-4', 'md:p-8', 'bg-white', 'rounded-2xl', 'shadow-2xl', 'w-full']);
+
+            container.appendChild(createElement('h2', ['text-3xl', 'font-extrabold', 'text-indigo-800', 'mb-2'], `${state.selection.subject} Quiz`));
+            container.appendChild(createElement('p', ['text-lg', 'font-medium', 'text-green-600', 'mb-6'], `Difficulty: ${state.selection.difficulty} | Total: ${state.quiz.length} Questions`));
+
+            const alertMessageContainer = createElement('div', ['p-0', 'mb-0', 'transition-all', 'duration-300']);
+            container.appendChild(alertMessageContainer);
+
+            const quizDiv = createElement('div', ['space-y-8']);
+            
+            state.quiz.forEach((q, index) => {
+                const qDiv = createElement('div', ['p-5', 'border', 'border-gray-200', 'rounded-xl', 'bg-gray-50', 'shadow-sm']);
+                
+                const questionText = createElement('p', ['font-semibold', 'text-lg', 'text-gray-800', 'mb-3']);
+                questionText.innerHTML = `${index + 1}. ${q.questionText} <span class="text-sm text-gray-500 font-normal ml-3">(${q.topic})</span>`;
+
+                // Render question text, substituting LaTeX tags for visual distinction
+                questionText.innerHTML = questionText.innerHTML.replace(/\$([^$]+)\$/g, (match, p1) => 
+                    `<span class="latex-display">${p1}</span>`
+                );
+                
+                qDiv.appendChild(questionText);
+                
+                const optionsDiv = createElement('div', ['space-y-2']);
+                
+                q.options.forEach((option, optIndex) => {
+                    const isSelected = state.userAnswers[q.id] === optIndex;
+                    
+                    const optDiv = createElement('div', [
+                        'p-3', 'rounded-lg', 'border', 'cursor-pointer', 'transition-colors',
+                        isSelected ? 'option-selected' : 'bg-white',
+                        isSelected ? 'border-indigo-500' : 'border-gray-200',
+                        'hover:bg-gray-100'
+                    ]);
+                    
+                    optDiv.innerHTML = `<span class="font-medium">${String.fromCharCode(65 + optIndex)}.</span> ${option}`;
+                    
+                    // Render option text, substituting LaTeX tags
+                    optDiv.innerHTML = optDiv.innerHTML.replace(/\$([^$]+)\$/g, (match, p1) => 
+                        `<span class="latex-display">${p1}</span>`
+                    );
+
+                    optDiv.onclick = () => {
+                        const newAnswers = { ...state.userAnswers, [q.id]: optIndex };
+                        setState({ userAnswers: newAnswers });
+                    };
+                    optionsDiv.appendChild(optDiv);
+                });
+                
+                qDiv.appendChild(optionsDiv);
+                quizDiv.appendChild(qDiv);
+            });
+            container.appendChild(quizDiv);
+
+            // Submit Button
+            const submitButton = createElement('button', [
+                'mt-8', 'w-full', 'py-4', 'text-xl', 'font-bold', 'bg-green-600', 'text-white',
+                'rounded-xl', 'shadow-lg', 'hover:bg-green-700', 'transition-colors',
+                'flex', 'items-center', 'justify-center'
+            ], 'Submit and Get Instant Analysis');
+            submitButton.prepend(renderIcon('CheckCircle', 'w-6 h-6 mr-2'));
+            
+            const handleSubmit = async () => {
+                if (Object.keys(state.userAnswers).length !== state.quiz.length) {
+                    alertMessageContainer.innerHTML = `<div class="p-3 mb-4 bg-red-100 border-l-4 border-red-500 text-red-700 rounded">Please answer all ${state.quiz.length} questions before submitting.</div>`;
+                    setTimeout(() => alertMessageContainer.innerHTML = '', 3000);
+                    return;
+                }
+
+                setState({ view: 'loading_analysis', loadingMessage: "Generating real-time analysis..." });
+
+                try {
+                    const analysis = await fetchAnalysis(state.quiz, state.userAnswers, state.selection.subject, state.selection.difficulty);
+
+                    // Save attempt to Firestore
+                    let attemptId = null;
+                    if (db && userId) {
+                        const historyPath = `artifacts/${appId}/users/${userId}/quizAttempts`;
+                        const newDocRef = doc(collection(db, historyPath));
+                        await setDoc(newDocRef, {
+                            timestamp: serverTimestamp(),
+                            subject: state.selection.subject,
+                            difficulty: state.selection.difficulty,
+                            score: analysis.scoreOutOf10,
+                            analysisSummary: analysis.summary,
+                            questions: state.quiz.map(q => {
+                                const solutionDetail = analysis.detailedSolutions.find(ds => ds.questionId === q.id);
+                                return {
+                                    id: q.id,
+                                    topic: q.topic,
+                                    isCorrect: solutionDetail ? solutionDetail.isCorrect : false,
+                                    userAnswerIndex: state.userAnswers[q.id],
+                                    correctAnswerIndex: q.correctAnswerIndex,
+                                    questionText: q.questionText,
+                                    options: q.options
+                                };
+                            }),
+                            rawAnalysis: analysis // Store full analysis for detail view
+                        });
+                        attemptId = newDocRef.id;
+                    }
+
+                    setState({ view: 'analysis', currentAttemptId: attemptId });
+                } catch (error) {
+                    console.error("Submission/Analysis Error:", error);
+                    setState({
+                        loadingMessage: "An error occurred during analysis. Please try again.",
+                        view: 'quiz' // Go back to quiz view
+                    });
+                    alertMessageContainer.innerHTML = `<div class="p-3 mb-4 bg-red-100 border-l-4 border-red-500 text-red-700 rounded">An error occurred during analysis. Please try again.</div>`;
+                    setTimeout(() => alertMessageContainer.innerHTML = '', 4000);
+                }
+            };
+            submitButton.onclick = handleSubmit;
+
+            container.appendChild(submitButton);
+            return container;
+        };
+
+        const renderAnalysisView = (isHistory = false) => {
+            const attempt = history.find(a => a.id === (isHistory ? state.selectedHistoryId : state.currentAttemptId));
+
+            if (!attempt || !attempt.rawAnalysis || !attempt.questions) {
+                return renderErrorDisplay("Analysis data is missing or failed to load.");
+            }
+
+            const detailedSolutions = attempt.rawAnalysis.detailedSolutions || [];
+            const score = attempt.rawAnalysis.scoreOutOf10 ?? 0;
+            const summary = attempt.rawAnalysis.summary ?? "Analysis summary not available.";
+            const strongPoints = attempt.rawAnalysis.strongPoints ?? [];
+            const weakPoints = attempt.rawAnalysis.weakPoints ?? [];
+            const quizSubject = attempt.subject ?? "Test";
+
+            const container = createElement('div', ['p-4', 'md:p-8', 'bg-white', 'rounded-2xl', 'shadow-2xl', 'w-full', 'relative']);
+
+            if (isHistory) {
+                const backButton = createElement('button', [
+                    'absolute', 'top-0', 'right-0', 'm-4', 'p-2', 'bg-gray-200', 
+                    'rounded-full', 'hover:bg-gray-300', 'text-gray-700', 'z-10'
+                ], '← Back to History');
+                backButton.onclick = () => setState({ view: 'history' });
+                container.appendChild(backButton);
+            }
+
+            container.appendChild(createElement('h2', ['text-4xl', 'font-extrabold', 'text-indigo-800', 'mb-2'], `Performance Report: ${quizSubject}`));
+            
+            // Score Card
+            const scoreColor = score >= 7 ? 'bg-green-600' : score >= 4 ? 'bg-yellow-600' : 'bg-red-600';
+            const scoreCard = createElement('div', [
+                'p-6', 'rounded-xl', 'text-white', 'shadow-xl', 'mb-6', 'flex', 
+                'flex-col', 'items-center', 'justify-center', scoreColor
+            ]);
+            scoreCard.appendChild(createElement('p', ['text-6xl', 'font-black'], `${score}/10`));
+            scoreCard.appendChild(createElement('p', ['text-xl', 'font-semibold', 'mt-2'], 'Score'));
+            container.appendChild(scoreCard);
+
+            // AI Summary
+            const summaryDiv = createElement('div', ['p-5', 'bg-indigo-50', 'rounded-xl', 'mb-6', 'border-l-4', 'border-indigo-600']);
+            summaryDiv.appendChild(createElement('h3', ['text-xl', 'font-bold', 'text-indigo-800', 'mb-2'], 'AI Performance Summary'));
+            summaryDiv.appendChild(createElement('p', ['text-gray-700'], summary));
+            container.appendChild(summaryDiv);
+
+            // Weak and Strong Points
+            const pointsGrid = createElement('div', ['grid', 'grid-cols-1', 'md:grid-cols-2', 'gap-4', 'mb-8']);
+            
+            const renderPoints = (points, isStrong) => {
+                const div = createElement('div', ['p-5', 'border-2', 'rounded-xl', isStrong ? 'bg-green-50 border-green-300' : 'bg-red-50 border-red-300']);
+                const h3 = createElement('h3', ['text-xl', 'font-bold', 'flex', 'items-center', 'mb-3', isStrong ? 'text-green-700' : 'text-red-700']);
+                h3.appendChild(renderIcon(isStrong ? 'TrendingUp' : 'TrendingDown', 'w-5 h-5 mr-2'));
+                h3.appendChild(document.createTextNode(isStrong ? ' Strong Points' : ' Weak Points'));
+                div.appendChild(h3);
+                
+                const ul = createElement('ul', ['list-disc', 'list-inside', 'space-y-1', 'text-gray-700']);
+                points.forEach(p => ul.appendChild(createElement('li', [], p)));
+                div.appendChild(ul);
+                return div;
+            };
+
+            pointsGrid.appendChild(renderPoints(strongPoints, true));
+            pointsGrid.appendChild(renderPoints(weakPoints, false));
+            container.appendChild(pointsGrid);
+
+            // Solutions Toggle
+            let showSolutions = false;
+            const toggleSolutions = createElement('button', [
+                'w-full', 'py-3', 'text-lg', 'font-bold', 'bg-indigo-600', 'text-white', 
+                'rounded-xl', 'shadow-md', 'hover:bg-indigo-700', 'transition-colors', 
+                'mb-6', 'flex', 'items-center', 'justify-center'
+            ]);
+            
+            const detailedSolutionsContainer = createElement('div', ['space-y-6', 'mt-4', 'hidden']);
+            
+            const updateSolutionsView = () => {
+                showSolutions = !showSolutions;
+                toggleSolutions.innerHTML = '';
+                toggleSolutions.appendChild(renderIcon('BookOpen', 'w-6 h-6 mr-2'));
+                toggleSolutions.appendChild(document.createTextNode(showSolutions ? 'Hide Detailed Solutions' : 'View Detailed Solutions & Doubt Clearing'));
+                detailedSolutionsContainer.classList.toggle('hidden', !showSolutions);
+            };
+            toggleSolutions.onclick = updateSolutionsView;
+            // Initialize button text
+            updateSolutionsView(); 
+            
+            container.appendChild(toggleSolutions);
+            
+            // Detailed Solutions Content
+            const solutionsHeader = createElement('h3', ['text-2xl', 'font-bold', 'text-indigo-800', 'border-b', 'pb-2'], 'Question-by-Question Analysis');
+            detailedSolutionsContainer.appendChild(solutionsHeader);
+            
+            attempt.questions.forEach((q, index) => {
+                const solution = detailedSolutions.find(ds => ds.questionId === q.id);
+                if (!solution) return;
+                
+                const isCorrect = solution.isCorrect;
+                const userAnswerIndex = solution.userAnswerIndex;
+                const correctAnswerIndex = q.correctAnswerIndex;
+                const userAnswerText = q.options[userAnswerIndex];
+                const correctAnswerText = q.options[correctAnswerIndex];
+
+                const qDiv = createElement('div', [
+                    'p-5', 'rounded-xl', 'shadow-lg', 
+                    isCorrect ? 'bg-green-50 border-l-4 border-green-500' : 'bg-red-50 border-l-4 border-red-500'
+                ]);
+
+                const headerDiv = createElement('div', ['flex', 'items-start', 'justify-between']);
+                
+                const qText = createElement('p', ['font-bold', 'text-xl', 'text-gray-800', 'mb-2']);
+                qText.innerHTML = `${index + 1}. ${q.questionText}`;
+                qText.innerHTML = qText.innerHTML.replace(/\$([^$]+)\$/g, (match, p1) => 
+                    `<span class="latex-display">${p1}</span>`
+                );
+
+                const iconDiv = createElement('div', ['flex-shrink-0', 'ml-4', isCorrect ? 'text-green-500' : 'text-red-500']);
+                iconDiv.appendChild(renderIcon(isCorrect ? 'CheckCircle' : 'XCircle', 'w-7 h-7'));
+
+                headerDiv.append(qText, iconDiv);
+                qDiv.appendChild(headerDiv);
+
+                qDiv.appendChild(createElement('p', ['text-sm', 'font-medium', 'mb-2'], 
+                    `Your Answer: <span class="${isCorrect ? 'text-green-600' : 'text-red-600'}">${userAnswerText ? userAnswerText.replace(/\$([^$]+)\$/g, '<span class="latex-display">$1</span>') : 'Not Answered'}</span>`
+                ));
+                
+                if (!isCorrect) {
+                    qDiv.appendChild(createElement('p', ['text-sm', 'font-medium', 'mb-3'], 
+                        `Correct Answer: <span class="text-green-600">${correctAnswerText.replace(/\$([^$]+)\$/g, '<span class="latex-display">$1</span>')}</span>`
+                    ));
+                }
+
+                qDiv.appendChild(createElement('p', ['font-semibold', 'text-gray-800', 'mt-3', 'mb-1'], 'Detailed Solution / Doubt Clearing:'));
+                qDiv.appendChild(createElement('p', ['text-gray-700', 'whitespace-pre-wrap'], solution.solution));
+
+                detailedSolutionsContainer.appendChild(qDiv);
+            });
+            
+            container.appendChild(detailedSolutionsContainer);
+
+            // Go Back Button (only shown if not history view)
+            if (!isHistory) {
+                const backToStartBtn = createElement('button', [
+                    'mt-8', 'w-full', 'py-3', 'text-lg', 'font-bold', 'bg-indigo-500', 
+                    'text-white', 'rounded-xl', 'shadow-md', 'hover:bg-indigo-600', 'transition-colors'
+                ], 'Go Back to Start New Quiz');
+                backToStartBtn.onclick = resetApp;
+                container.appendChild(backToStartBtn);
+            }
+
+            return container;
+        };
+
+        const renderHistoryView = () => {
+            const container = createElement('div', ['p-4', 'md:p-8', 'bg-white', 'rounded-2xl', 'shadow-2xl', 'w-full', 'max-w-4xl']);
+            
+            if (history.length === 0) {
+                const emptyDiv = createElement('div', ['p-8', 'text-center', 'bg-white', 'rounded-xl', 'shadow-lg', 'max-w-lg', 'w-full']);
+                emptyDiv.appendChild(createElement('h3', ['text-2xl', 'font-semibold', 'text-gray-700'], 'No History Found'));
+                emptyDiv.appendChild(createElement('p', ['text-gray-500', 'mt-2'], 'Start a quiz to see your performance logs here!'));
+                container.appendChild(emptyDiv);
+                return container;
+            }
+
+            container.appendChild(createElement('h2', ['text-3xl', 'font-extrabold', 'text-indigo-800', 'mb-6'], 'Your Quiz History'));
+            const historyList = createElement('div', ['space-y-4']);
+
+            history.forEach((attempt) => {
+                const scoreColor = attempt.score >= 7 ? '#10B981' : attempt.score >= 4 ? '#F59E0B' : '#EF4444';
+                const attemptDiv = createElement('div', [
+                    'p-4', 'bg-gray-50', 'rounded-xl', 'shadow-sm', 'border-l-4', 'border-indigo-400',
+                    'hover:shadow-md', 'transition-shadow', 'cursor-pointer', 'flex', 
+                    'justify-between', 'items-center'
+                ]);
+
+                attemptDiv.onclick = () => setState({ selectedHistoryId: attempt.id, view: 'history_analysis' });
+                
+                const date = attempt.timestamp?.seconds ? new Date(attempt.timestamp.seconds * 1000).toLocaleString() : 'Loading...';
+
+                const textDiv = createElement('div');
+                textDiv.appendChild(createElement('p', ['font-bold', 'text-xl', 'text-indigo-700'], `${attempt.subject} - ${attempt.difficulty}`));
+                textDiv.appendChild(createElement('p', ['text-sm', 'text-gray-500'], date));
+
+                const scoreDiv = createElement('div', ['text-right']);
+                scoreDiv.appendChild(createElement('p', ['text-3xl', 'font-extrabold'], `${attempt.score}/10`));
+                scoreDiv.lastChild.style.color = scoreColor;
+                scoreDiv.appendChild(createElement('p', ['text-xs', 'font-medium', 'text-gray-600'], 'Click for Details'));
+
+                attemptDiv.append(textDiv, scoreDiv);
+                historyList.appendChild(attemptDiv);
+            });
+
+            container.appendChild(historyList);
+            return container;
+        };
+        
+        // --- MAIN APP LOGIC ---
+        
+        const resetApp = () => {
+            setState({ 
+                selection: { subject: null, difficulty: null },
+                quiz: null,
+                userAnswers: {},
+                view: 'selection',
+                currentAttemptId: null,
+                selectedHistoryId: null
+            });
+        };
+
+        const renderView = () => {
+            switch (state.view) {
+                case 'loading_auth':
+                    return renderLoadingSpinner(state.loadingMessage);
+                case 'error':
+                    return renderErrorDisplay(authError || "An unknown application error occurred.");
+                case 'selection':
+                    return renderQuizSelection();
+                case 'loading_quiz':
+                case 'loading_analysis':
+                    return renderLoadingSpinner(state.loadingMessage);
+                case 'quiz':
+                    return renderQuizView();
+                case 'analysis':
+                    return renderAnalysisView(false); // isHistory = false
+                case 'history':
+                    return renderHistoryView();
+                case 'history_analysis':
+                    return renderAnalysisView(true); // isHistory = true
+                default:
+                    return renderQuizSelection();
+            }
+        };
+
+        const renderApp = () => {
+            const appRoot = document.getElementById('app');
+            appRoot.innerHTML = ''; // Clear previous content
+
+            // 1. Render Header
+            appRoot.appendChild(renderHeader());
+
+            // 2. Render Main Content Wrapper
+            const mainContainer = createElement('main', [
+                'flex-grow', 'w-full', 'max-w-4xl', 'p-4', 'md:p-8', 'flex', 'items-start', 'justify-center'
+            ]);
+            const contentWrapper = createElement('div', ['w-full']);
+
+            // Render the current view inside the wrapper
+            const currentViewElement = renderView();
+            if (currentViewElement) {
+                // If it's a loading/error state, center it vertically on the screen
+                if (['loading_auth', 'error', 'loading_quiz', 'loading_analysis'].includes(state.view)) {
+                    mainContainer.classList.remove('items-start');
+                    mainContainer.classList.add('items-center');
+                } else {
+                    mainContainer.classList.remove('items-center');
+                    mainContainer.classList.add('items-start');
+                }
+                contentWrapper.appendChild(currentViewElement);
+            }
+            
+            mainContainer.appendChild(contentWrapper);
+            appRoot.appendChild(mainContainer);
+
+            // 3. Render Footer
+            appRoot.appendChild(renderFooter());
+        };
+
+        // --- INITIALIZATION ---
+        window.onload = () => {
+            initializeFirebase();
+            // Initial render starts in 'loading_auth' state
+            renderApp(); 
+        };
+
+    </script>
+</body>
+</html>
