@@ -42,6 +42,11 @@
             from { transform: rotate(0deg); }
             to { transform: rotate(360deg); }
         }
+        /* Style for the icon placeholders before they are replaced by the script */
+        .lucide-icon-placeholder {
+            display: inline-block;
+            line-height: 1; /* Prevent the icon from taking up too much vertical space */
+        }
     </style>
 </head>
 <body class="min-h-screen">
@@ -74,7 +79,7 @@
         let auth = null;
         let userId = null;
         let isAuthReady = false;
-        let authError = null;
+        let authError = null; // Used to store errors for display
         let history = [];
         let historyUnsubscribe = null; // To manage the Firestore subscription
 
@@ -184,40 +189,12 @@
             return el;
         };
         
-        // Reworked Function to render Lucide Icons safely (returns the SVG Element)
-        const getIconSvg = (name) => {
-            // Check if Lucide library and the specific icon exists
-            if (typeof lucide === 'undefined' || !lucide.icons || !lucide.icons[name]) {
-                return null;
-            }
-
-            try {
-                // Use the programmatic API to generate the SVG string. 
-                // We let the wrapper element (in renderIcon) handle classes.
-                const svgString = lucide.icons[name].toSvg({
-                    width: '100%',
-                    height: '100%',
-                    class: '' 
-                });
-                
-                // Create a temporary element to parse the SVG string into a DOM element
-                const tempDiv = document.createElement('div');
-                tempDiv.innerHTML = svgString;
-
-                // The first child is the SVG element itself
-                return tempDiv.firstChild;
-
-            } catch (e) {
-                console.error(`Error generating SVG for icon "${name}":`, e);
-                return null;
-            }
-        };
-
-        // Function to render Lucide Icons (returns the SVG element wrapped in a span, or just the span)
+        // Function to render Lucide Icons (returns a span placeholder for the Lucide script to replace)
         const renderIcon = (name, classes = 'w-5 h-5 mr-2') => {
-            const iconContainer = createElement('span', classes.split(' '));
-            const svg = getIconSvg(name); // Now returns the SVG element
-            if (svg) iconContainer.appendChild(svg);
+            // Use a span with the data-lucide attribute. The lucide script will automatically
+            // search the DOM and replace this with the corresponding SVG when lucide.createIcons() is called.
+            const iconContainer = createElement('span', [...classes.split(' '), 'lucide-icon-placeholder']);
+            iconContainer.setAttribute('data-lucide', name);
             return iconContainer;
         };
 
@@ -230,14 +207,11 @@
         // --- FIREBASE LOGIC ---
 
         const initializeFirebase = () => {
-            if (Object.keys(firebaseConfig).length === 0) {
-                authError = "Firebase configuration is missing or invalid.";
-                isAuthReady = true;
-                setState({ view: 'error' });
-                return;
-            }
+            // NOTE: We rely on the environment to provide valid firebaseConfig. 
+            // If it's empty, we catch the initialization error but allow the LLM part of the app to proceed.
 
             try {
+                // This call will likely throw an error if firebaseConfig is empty or malformed
                 const app = initializeApp(firebaseConfig);
                 db = getFirestore(app);
                 auth = getAuth(app);
@@ -253,7 +227,7 @@
                         }
                     } catch (e) {
                         console.error("Authentication failed during sign-in attempt:", e);
-                        authError = "Failed to sign in. Check console for details.";
+                        authError = "Failed to sign in. Check console for details. History will be unavailable.";
                     }
                 };
 
@@ -266,8 +240,9 @@
                         setState({ view: 'selection' });
                     } else {
                         userId = null;
-                        if (!authError) authError = "Authentication check failed. Please try again.";
-                        setState({ view: 'error' });
+                        // If auth fails and no prior error, set a generic one
+                        if (!authError) authError = "Authentication check failed. History will be unavailable.";
+                        setState({ view: 'selection' }); // Go to selection view regardless of auth failure
                     }
                     isAuthReady = true;
                 });
@@ -276,14 +251,18 @@
                 authenticate();
             } catch (e) {
                 console.error("Firebase Initialization Error:", e);
-                authError = "Could not initialize Firebase services.";
+                authError = "Could not initialize Firebase services. Persistence/History features are disabled.";
                 isAuthReady = true;
-                setState({ view: 'error' });
+                // If initialization fails, we set the view to selection so the user can still use the core LLM functionality.
+                setState({ view: 'selection' }); 
             }
         };
 
         const startHistoryListener = () => {
             if (!isAuthReady || !userId || !db) return;
+            
+            // Do not start listener if we know the DB initialization failed
+            if (authError && authError.includes("initialize Firebase services")) return;
 
             if (historyUnsubscribe) historyUnsubscribe(); // Clean up previous listener
 
@@ -301,6 +280,7 @@
                 }
             }, (error) => {
                 console.error("Firestore history snapshot error:", error);
+                authError = "Failed to load history data. Persistence might be broken.";
             });
         };
 
@@ -393,22 +373,25 @@
             // Controls and User ID
             const controlArea = createElement('div', ['flex', 'items-center', 'space-x-4']);
             
-            const controlButton = createElement('button', [
-                'p-2', 'text-sm', 'font-semibold', 'rounded-full', 'transition-colors',
-                'bg-indigo-100', 'text-indigo-700', 'hover:bg-indigo-200'
-            ]);
-            
-            if (state.view === 'selection') {
-                controlButton.textContent = 'View History';
-                controlButton.onclick = () => setState({ view: 'history' });
-            } else {
-                controlButton.textContent = 'New Quiz';
-                controlButton.onclick = resetApp;
+            if (db && !authError) {
+                 const controlButton = createElement('button', [
+                    'p-2', 'text-sm', 'font-semibold', 'rounded-full', 'transition-colors',
+                    'bg-indigo-100', 'text-indigo-700', 'hover:bg-indigo-200'
+                ]);
+                
+                if (state.view === 'selection') {
+                    controlButton.textContent = 'View History';
+                    controlButton.onclick = () => setState({ view: 'history' });
+                } else {
+                    controlButton.textContent = 'New Quiz';
+                    controlButton.onclick = resetApp;
+                }
+                controlArea.appendChild(controlButton);
             }
 
             const userIdDisplay = createElement('span', ['text-xs', 'text-gray-500', 'hidden', 'sm:block'], `User ID: ${userId ? userId.substring(0, 8) + '...' : 'N/A'}`);
             
-            controlArea.append(controlButton, userIdDisplay);
+            controlArea.append(userIdDisplay);
             
             container.append(logoArea, controlArea);
             header.appendChild(container);
@@ -434,7 +417,7 @@
             const container = createElement('div', ['flex', 'flex-col', 'items-center', 'justify-center', 'p-8', 'bg-white/50', 'rounded-xl', 'shadow-lg', 'max-w-md', 'w-full']);
             
             const spinner = createElement('div', ['h-10', 'w-10', 'animate-spin', 'text-indigo-600']);
-            // FIX: Ensure icon fills container using w-full h-full classes on the span
+            // Using placeholder for icon
             spinner.appendChild(renderIcon('RefreshCcw', 'w-full h-full')); 
 
             const p1 = createElement('p', ['mt-4', 'text-center', 'text-indigo-700', 'font-medium'], message);
@@ -448,7 +431,6 @@
             const container = createElement('div', ['p-6', 'md:p-10', 'bg-white', 'rounded-2xl', 'shadow-2xl', 'max-w-lg', 'w-full']);
             
             const h2 = createElement('h2', ['text-3xl', 'font-extrabold', 'text-indigo-800', 'mb-6', 'flex', 'items-center']);
-            // FIX: Add icon with specific classes, then append text content
             h2.appendChild(renderIcon('Brain', 'w-6 h-6 mr-3'));
             h2.appendChild(document.createTextNode(' Start a New Quiz'));
             
@@ -456,6 +438,15 @@
 
             const alertMessageContainer = createElement('div', ['p-0', 'mb-0', 'transition-all', 'duration-300']);
             container.appendChild(alertMessageContainer);
+            
+            // Display auth/firebase error if it exists
+            if (authError) {
+                const errorDiv = createElement('div', [
+                    'p-3', 'mb-4', 'bg-yellow-100', 'border-l-4', 'border-yellow-500', 
+                    'text-yellow-700', 'rounded', 'text-sm'
+                ], `Warning: ${authError}. You can still generate quizzes, but data saving and history will not work.`);
+                container.appendChild(errorDiv);
+            }
 
             // Subject Selection
             const subjectDiv = createElement('div', ['mb-8']);
@@ -624,35 +615,40 @@
                 try {
                     const analysis = await fetchAnalysis(state.quiz, state.userAnswers, state.selection.subject, state.selection.difficulty);
 
-                    // Save attempt to Firestore
+                    // Save attempt to Firestore (Only attempt if Firebase initialized successfully)
                     let attemptId = null;
-                    if (db && userId) {
-                        const historyPath = `artifacts/${appId}/users/${userId}/quizAttempts`;
-                        const newDocRef = doc(collection(db, historyPath));
-                        await setDoc(newDocRef, {
-                            timestamp: serverTimestamp(),
-                            subject: state.selection.subject,
-                            difficulty: state.selection.difficulty,
-                            score: analysis.scoreOutOf10,
-                            analysisSummary: analysis.summary,
-                            questions: state.quiz.map(q => {
-                                const solutionDetail = analysis.detailedSolutions.find(ds => ds.questionId === q.id);
-                                return {
-                                    id: q.id,
-                                    topic: q.topic,
-                                    isCorrect: solutionDetail ? solutionDetail.isCorrect : false,
-                                    userAnswerIndex: state.userAnswers[q.id],
-                                    correctAnswerIndex: q.correctAnswerIndex,
-                                    questionText: q.questionText,
-                                    options: q.options
-                                };
-                            }),
-                            rawAnalysis: analysis // Store full analysis for detail view
-                        });
-                        attemptId = newDocRef.id;
+                    if (db && userId && !authError) {
+                        try {
+                            const historyPath = `artifacts/${appId}/users/${userId}/quizAttempts`;
+                            const newDocRef = doc(collection(db, historyPath));
+                            await setDoc(newDocRef, {
+                                timestamp: serverTimestamp(),
+                                subject: state.selection.subject,
+                                difficulty: state.selection.difficulty,
+                                score: analysis.scoreOutOf10,
+                                analysisSummary: analysis.summary,
+                                questions: state.quiz.map(q => {
+                                    const solutionDetail = analysis.detailedSolutions.find(ds => ds.questionId === q.id);
+                                    return {
+                                        id: q.id,
+                                        topic: q.topic,
+                                        isCorrect: solutionDetail ? solutionDetail.isCorrect : false,
+                                        userAnswerIndex: state.userAnswers[q.id],
+                                        correctAnswerIndex: q.correctAnswerIndex,
+                                        questionText: q.questionText,
+                                        options: q.options
+                                    };
+                                }),
+                                rawAnalysis: analysis // Store full analysis for detail view
+                            });
+                            attemptId = newDocRef.id;
+                        } catch (saveError) {
+                            console.error("Firestore Save Error:", saveError);
+                            authError = "Failed to save data. History will be unavailable.";
+                        }
                     }
 
-                    setState({ view: 'analysis', currentAttemptId: attemptId });
+                    setState({ view: 'analysis', currentAttemptId: attemptId, rawAnalysis: analysis });
                 } catch (error) {
                     console.error("Submission/Analysis Error:", error);
                     setState({
@@ -670,17 +666,29 @@
         };
 
         const renderAnalysisView = (isHistory = false) => {
-            const attempt = history.find(a => a.id === (isHistory ? state.selectedHistoryId : state.currentAttemptId));
-
-            if (!attempt || !attempt.rawAnalysis || !attempt.questions) {
-                return renderErrorDisplay("Analysis data is missing or failed to load.");
+            let attempt;
+            let analysisData;
+            
+            if (isHistory) {
+                attempt = history.find(a => a.id === state.selectedHistoryId);
+                analysisData = attempt?.rawAnalysis;
+            } else {
+                // For immediate analysis, use the data stored in the state, falling back to history if saved
+                attempt = history.find(a => a.id === state.currentAttemptId);
+                analysisData = state.rawAnalysis || attempt?.rawAnalysis; 
+                // We assume state.rawAnalysis is set after generation if not from history
             }
 
-            const detailedSolutions = attempt.rawAnalysis.detailedSolutions || [];
-            const score = attempt.rawAnalysis.scoreOutOf10 ?? 0;
-            const summary = attempt.rawAnalysis.summary ?? "Analysis summary not available.";
-            const strongPoints = attempt.rawAnalysis.strongPoints ?? [];
-            const weakPoints = attempt.rawAnalysis.weakPoints ?? [];
+
+            if (!analysisData || !attempt?.questions) {
+                return renderErrorDisplay("Analysis data is missing or failed to load. Try viewing the history after a refresh if the save was successful.");
+            }
+
+            const detailedSolutions = analysisData.detailedSolutions || [];
+            const score = analysisData.scoreOutOf10 ?? 0;
+            const summary = analysisData.summary ?? "Analysis summary not available.";
+            const strongPoints = analysisData.strongPoints ?? [];
+            const weakPoints = analysisData.weakPoints ?? [];
             const quizSubject = attempt.subject ?? "Test";
 
             const container = createElement('div', ['p-4', 'md:p-8', 'bg-white', 'rounded-2xl', 'shadow-2xl', 'w-full', 'relative']);
@@ -822,6 +830,15 @@
         const renderHistoryView = () => {
             const container = createElement('div', ['p-4', 'md:p-8', 'bg-white', 'rounded-2xl', 'shadow-2xl', 'w-full', 'max-w-4xl']);
             
+            if (authError) {
+                const errorDiv = createElement('div', [
+                    'p-3', 'mb-6', 'bg-red-100', 'border-l-4', 'border-red-500', 
+                    'text-red-700', 'rounded', 'text-sm'
+                ], `Cannot load history: ${authError}`);
+                container.appendChild(errorDiv);
+                return container;
+            }
+
             if (history.length === 0) {
                 const emptyDiv = createElement('div', ['p-8', 'text-center', 'bg-white', 'rounded-xl', 'shadow-lg', 'max-w-lg', 'w-full']);
                 emptyDiv.appendChild(createElement('h3', ['text-2xl', 'font-semibold', 'text-gray-700'], 'No History Found'));
@@ -871,15 +888,18 @@
                 userAnswers: {},
                 view: 'selection',
                 currentAttemptId: null,
-                selectedHistoryId: null
+                selectedHistoryId: null,
+                rawAnalysis: null
             });
         };
 
         const renderView = () => {
             switch (state.view) {
                 case 'loading_auth':
-                    return renderLoadingSpinner(state.loadingMessage);
+                    // If auth fails fast, we automatically switch to 'selection' view, so this mostly shows briefly
+                    return renderLoadingSpinner(state.loadingMessage); 
                 case 'error':
+                    // We try to avoid this view now, opting for 'selection' with a warning
                     return renderErrorDisplay(authError || "An unknown application error occurred.");
                 case 'selection':
                     return renderQuizSelection();
@@ -931,6 +951,12 @@
 
             // 3. Render Footer
             appRoot.appendChild(renderFooter());
+
+            // 4. IMPORTANT: Render Lucide Icons after DOM updates
+            // This function finds all elements with data-lucide attributes and replaces them with SVG
+            if (typeof lucide !== 'undefined' && lucide.createIcons) {
+                lucide.createIcons();
+            }
         };
 
         // --- INITIALIZATION ---
